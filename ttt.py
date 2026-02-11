@@ -28,21 +28,118 @@ class ReplayBuffer:
         # This provides a random batch of memories to break correlation
         return random.sample(self.buffer, batch_size)
 
+def _check_winner_static(b: list) -> int:
+    """Check winner of board b. Returns 1, -1, or 0 (no winner)."""
+    for i in range(3):
+        if b[i*3] == b[i*3+1] == b[i*3+2] != 0:
+            return b[i*3]
+        if b[i] == b[i+3] == b[i+6] != 0:
+            return b[i]
+    if b[0] == b[4] == b[8] != 0:
+        return b[0]
+    if b[2] == b[4] == b[6] != 0:
+        return b[2]
+    return 0
+
+
+def minimax_best_move(board: list, player: int) -> int:
+    """Return the best move for `player` using full minimax search.
+    `player` is the current player to move (1 or -1)."""
+
+    def _minimax(b: list, is_maximizing: bool) -> int:
+        """Returns score from `player`'s perspective: +1 win, -1 loss, 0 draw."""
+        w = _check_winner_static(b)
+        if w == player:
+            return 1
+        elif w == -player:
+            return -1
+        moves = [i for i in range(9) if b[i] == 0]
+        if not moves:
+            return 0
+        # Determine whose turn it is
+        x_count = sum(1 for c in b if c == 1)
+        o_count = sum(1 for c in b if c == -1)
+        current = 1 if x_count == o_count else -1
+
+        if is_maximizing:
+            best = -2
+            for m in moves:
+                nb = b[:]
+                nb[m] = current
+                score = _minimax(nb, current != player)
+                if score > best:
+                    best = score
+            return best
+        else:
+            best = 2
+            for m in moves:
+                nb = b[:]
+                nb[m] = current
+                score = _minimax(nb, current != player)
+                if score < best:
+                    best = score
+            return best
+
+    moves = [i for i in range(9) if board[i] == 0]
+    best_score = -2
+    best_move = moves[0]
+    for m in moves:
+        nb = board[:]
+        nb[m] = player
+        # After player moves, it's opponent's turn => not maximizing
+        score = _minimax(nb, False)
+        if score > best_score:
+            best_score = score
+            best_move = m
+    return best_move
+
+
 class DataCollector:
-    def __init__(self, buffer: ReplayBuffer, model, epsilon: float):
+    def __init__(self, buffer: ReplayBuffer, model, epsilon: float,
+                 forced_opening_ratio: float = 0.0,
+                 minimax_opponent_ratio: float = 0.0):
         self.buffer = buffer
         self.model = model
         self.epsilon = epsilon
-    
+        # Fraction of games that start with a forced random opening move
+        self.forced_opening_ratio = forced_opening_ratio
+        # Fraction of games played against minimax opponent
+        self.minimax_opponent_ratio = minimax_opponent_ratio
+
     def collect_data(self, num_episodes: int):
         env = TicTacToeEnv()
         for episode in range(num_episodes):
             env.reset()
             done = False
+
+            use_minimax_opp = random.random() < self.minimax_opponent_ratio
+            # Randomly assign minimax to play as X or O
+            minimax_player = random.choice([1, -1]) if use_minimax_opp else None
+
+            # Force diverse openings: play 1-2 random moves at start
+            if random.random() < self.forced_opening_ratio:
+                # Force 1 or 2 random opening moves to create diverse positions
+                num_forced = random.choice([1, 2])
+                for _ in range(num_forced):
+                    if done:
+                        break
+                    player = env.current_player
+                    state_norm = _normalize_board(env.board, player)
+                    action = random.choice(env.legal_moves())
+                    next_state_raw, reward, done = env.step(action)
+                    next_state_norm = _normalize_board(next_state_raw, env.current_player)
+                    self.buffer.push(state_norm, action, reward, next_state_norm, done)
+
             while not done:
                 player = env.current_player
                 state_norm = _normalize_board(env.board, player)
-                action = self.select_action(env)
+
+                # Use minimax for the designated player if applicable
+                if minimax_player is not None and player == minimax_player:
+                    action = minimax_best_move(env.board, player)
+                else:
+                    action = self.select_action(env)
+
                 next_state_raw, reward, done = env.step(action)
                 # Normalize next_state from the NEXT player's perspective
                 next_state_norm = _normalize_board(next_state_raw, env.current_player)
@@ -370,6 +467,9 @@ def train_model(
     episodes_per_step: int = 10,
     target_tau: float = 0.005,
     initial_weights: List[np.ndarray] | None = None,
+    grad_clip: float = 1.0,
+    forced_opening_ratio: float = 0.5,
+    minimax_opponent_ratio: float = 0.3,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
     Train the TTT Q-network. Returns (w1, w2, w3, b1, b2, b3) as numpy.
@@ -383,6 +483,9 @@ def train_model(
     blending factor target_tau (Polyak averaging).
     If initial_weights is provided ([w1, w2, w3, b1, b2, b3]), training resumes from those
     weights instead of random initialization.
+    grad_clip: max gradient norm for clipping (0 = no clipping).
+    forced_opening_ratio: fraction of self-play games starting with random forced opening moves.
+    minimax_opponent_ratio: fraction of games played against minimax opponent.
     """
     if initial_weights is not None:
         w1, w2, w3, b1, b2, b3 = initial_weights
@@ -398,8 +501,15 @@ def train_model(
     # Target network: a frozen snapshot of the weights used for stable TD targets.
     target_weights = [w.copy() for w in model.weights]
 
+    # Adam optimizer state (per-parameter momentum and variance)
+    adam_m = [np.zeros_like(w) for w in model.weights]  # first moment
+    adam_v = [np.zeros_like(w) for w in model.weights]  # second moment
+    adam_beta1, adam_beta2, adam_eps = 0.9, 0.999, 1e-8
+
     buffer = ReplayBuffer(buffer_capacity)
-    data_collector = DataCollector(buffer, model, epsilon_start)
+    data_collector = DataCollector(buffer, model, epsilon_start,
+                                   forced_opening_ratio=forced_opening_ratio,
+                                   minimax_opponent_ratio=minimax_opponent_ratio)
     data_collector.collect_data(num_episodes)
 
     try:
@@ -456,15 +566,29 @@ def train_model(
                 d_b2_acc += d_b2_j
                 d_b3_acc += d_b3_j
 
-            # Learning rate decay
+            grads = [d_w1_acc, d_w2_acc, d_w3_acc, d_b1_acc, d_b2_acc, d_b3_acc]
+
+            # Gradient clipping by global norm
+            if grad_clip > 0:
+                global_norm = math.sqrt(sum(float(np.sum(g ** 2)) for g in grads))
+                if global_norm > grad_clip:
+                    scale = grad_clip / global_norm
+                    grads = [g * scale for g in grads]
+
+            # Learning rate with decay
             lr = learning_rate * (lr_decay ** step)
 
-            w1 = w1 - lr * d_w1_acc
-            w2 = w2 - lr * d_w2_acc
-            w3 = w3 - lr * d_w3_acc
-            b1 = b1 - lr * d_b1_acc
-            b2 = b2 - lr * d_b2_acc
-            b3 = b3 - lr * d_b3_acc
+            # Adam update
+            t_adam = step + 1
+            weights_list = [w1, w2, w3, b1, b2, b3]
+            for i in range(6):
+                adam_m[i] = adam_beta1 * adam_m[i] + (1 - adam_beta1) * grads[i]
+                adam_v[i] = adam_beta2 * adam_v[i] + (1 - adam_beta2) * (grads[i] ** 2)
+                m_hat = adam_m[i] / (1 - adam_beta1 ** t_adam)
+                v_hat = adam_v[i] / (1 - adam_beta2 ** t_adam)
+                weights_list[i] = weights_list[i] - lr * m_hat / (np.sqrt(v_hat) + adam_eps)
+
+            w1, w2, w3, b1, b2, b3 = weights_list
             model.weights = [w1, w2, w3, b1, b2, b3]
 
             # Soft (Polyak) target network update each step
@@ -545,35 +669,61 @@ def main() -> None:
                         help="Resume training from existing weights file")
     args = parser.parse_args()
 
+    import sys
     weights_path = args.weights_path
-    log_interval = 500
-    num_episodes = 1000
-    num_train_steps = 20000
+    log_interval = 100
+    num_episodes = 2000          # More initial episodes for diverse buffer fill
+    num_train_steps = 40000      # More steps to learn all positions
     episodes_per_step = 10
-    epsilon_decay = 0.9997
+    epsilon_decay = 0.99985      # Slower decay => more exploration over 40k steps
     batch_size = 128
+    epsilon_start = 1.0
+    epsilon_end = 0.08           # Higher floor for continued exploration
+    learning_rate = 5e-4         # Slightly lower LR for stability with Adam
+    lr_decay = 0.99999
+    buffer_capacity = 50000      # Much larger buffer for diverse experiences
+    target_tau = 0.005
+    grad_clip = 1.0              # Gradient clipping for stability
+    forced_opening_ratio = 0.5   # 50% of games start with random forced openings
+    minimax_opponent_ratio = 0.3 # 30% of games against perfect minimax
 
     initial_weights = None
     if args.resume:
         print("Resuming from", weights_path, "...")
         w1, w2, w3, b1, b2, b3 = load_weights(weights_path)
         initial_weights = [w1, w2, w3, b1, b2, b3]
+        # When resuming, start with moderate exploration to fix weak spots
+        epsilon_start = 0.4
 
     def on_progress(step: int, loss: float, step_time_sec: float) -> None:
-        print(f"  step {step:5d} / {num_train_steps}  loss = {loss:.6f}  step_time = {step_time_sec:.3f}s")
+        print(f"  step {step:5d} / {num_train_steps}  loss = {loss:.6f}  step_time = {step_time_sec:.3f}s  eps={max(epsilon_end, epsilon_start * (epsilon_decay ** step)):.4f}")
+        sys.stdout.flush()
 
     print("Training TTT Q-network ...")
-    print(f"  Episodes: {num_episodes}, Train steps: {num_train_steps}, Log every: {log_interval}, Episodes/step: {episodes_per_step}")
+    print(f"  Episodes: {num_episodes}, Train steps: {num_train_steps}, Batch: {batch_size}")
+    print(f"  LR: {learning_rate}, Epsilon: {epsilon_start}->{epsilon_end} (decay={epsilon_decay})")
+    print(f"  Buffer: {buffer_capacity}, Forced openings: {forced_opening_ratio}, Minimax opp: {minimax_opponent_ratio}")
+    print(f"  Grad clip: {grad_clip}, Target tau: {target_tau}, Adam optimizer")
+    sys.stdout.flush()
     w1, w2, w3, b1, b2, b3 = train_model(
         num_episodes=num_episodes,
         num_train_steps=num_train_steps,
         batch_size=batch_size,
+        learning_rate=learning_rate,
+        lr_decay=lr_decay,
+        buffer_capacity=buffer_capacity,
+        epsilon_start=epsilon_start,
+        epsilon_end=epsilon_end,
         epsilon_decay=epsilon_decay,
         log_interval=log_interval,
         progress_callback=on_progress,
         weights_path=weights_path,
         episodes_per_step=episodes_per_step,
+        target_tau=target_tau,
         initial_weights=initial_weights,
+        grad_clip=grad_clip,
+        forced_opening_ratio=forced_opening_ratio,
+        minimax_opponent_ratio=minimax_opponent_ratio,
     )
     print("Saving weights to", weights_path)
     save_weights(w1, w2, w3, b1, b2, b3, weights_path)
