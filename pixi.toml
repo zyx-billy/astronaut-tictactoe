@@ -1,0 +1,12 @@
+[workspace]
+authors = ["Billy Zhu <billyzhu@modular.com>"]
+channels = ["https://conda.modular.com/max-nightly", "conda-forge"]
+name = "max_hackathon"
+platforms = ["linux-64"]
+version = "0.1.0"
+
+[tasks]
+
+[dependencies]
+modular = ">=26.2.0.dev2026020905,<27"
+python = "==3.11"
