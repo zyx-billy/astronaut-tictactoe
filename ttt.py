@@ -222,68 +222,78 @@ def _tensor_to_numpy(t: Tensor) -> np.ndarray:
     return np.from_dlpack(t)
 
 
+def _build_forward_graph(name, input_type, w1t, w2t, w3t, b1t, b2t, b3t):
+    """Build forward graph. Works for both single (9,) and batched (B,9) inputs
+    thanks to matmul/addition broadcasting."""
+    with Graph(
+        name,
+        input_types=(input_type, w1t, w2t, w3t, b1t, b2t, b3t),
+    ) as graph:
+        input_val = graph.inputs[0]
+        w1, w2, w3 = graph.inputs[1], graph.inputs[2], graph.inputs[3]
+        b1, b2, b3 = graph.inputs[4], graph.inputs[5], graph.inputs[6]
+        input_f = ops.cast(input_val, DType.float32)
+        step1 = F.relu(input_f @ w1 + b1)
+        step2 = F.relu(step1 @ w2 + b2)
+        step3 = step2 @ w3 + b3
+        graph.output(step3)
+    return graph
+
+
 class TTTModel:
     """TTT Q-network with biases. Weights stored as numpy; only converted to Tensor at execute/backward boundary.
 
     weights is a list of 6 numpy arrays: [w1, w2, w3, b1, b2, b3].
+    If batch_size is provided, batched forward/backward graphs are compiled for training.
     """
 
-    def __init__(self, weights: List[np.ndarray]):
-        # 1. Build the graph (Max Tensor types only).
-        input_type = TensorType(
-            dtype=DType.int32, shape=(9,), device=DeviceRef.CPU()
-        )
-        w1t = TensorType(
-            dtype=DType.float32, shape=(9, 128), device=DeviceRef.CPU()
-        )
-        w2t = TensorType(
-            dtype=DType.float32, shape=(128, 64), device=DeviceRef.CPU()
-        )
-        w3t = TensorType(
-            dtype=DType.float32, shape=(64, 9), device=DeviceRef.CPU()
-        )
-        b1t = TensorType(
-            dtype=DType.float32, shape=(128,), device=DeviceRef.CPU()
-        )
-        b2t = TensorType(
-            dtype=DType.float32, shape=(64,), device=DeviceRef.CPU()
-        )
-        b3t = TensorType(
-            dtype=DType.float32, shape=(9,), device=DeviceRef.CPU()
-        )
-        with Graph(
-            "ttt_model",
-            input_types=(input_type, w1t, w2t, w3t, b1t, b2t, b3t),
-        ) as graph:
-            input = graph.inputs[0]
-            w1 = graph.inputs[1]
-            w2 = graph.inputs[2]
-            w3 = graph.inputs[3]
-            b1 = graph.inputs[4]
-            b2 = graph.inputs[5]
-            b3 = graph.inputs[6]
-            input_f = ops.cast(input, DType.float32)
-            step1 = F.relu(input_f @ w1 + b1)
-            step2 = F.relu(step1 @ w2 + b2)
-            step3 = step2 @ w3 + b3
-            graph.output(step3)
+    def __init__(self, weights: List[np.ndarray], batch_size: int | None = None):
+        # Weight TensorTypes (shared by all graphs)
+        w1t = TensorType(dtype=DType.float32, shape=(9, 128), device=DeviceRef.CPU())
+        w2t = TensorType(dtype=DType.float32, shape=(128, 64), device=DeviceRef.CPU())
+        w3t = TensorType(dtype=DType.float32, shape=(64, 9), device=DeviceRef.CPU())
+        b1t = TensorType(dtype=DType.float32, shape=(128,), device=DeviceRef.CPU())
+        b2t = TensorType(dtype=DType.float32, shape=(64,), device=DeviceRef.CPU())
+        b3t = TensorType(dtype=DType.float32, shape=(9,), device=DeviceRef.CPU())
 
-        self.graph = graph
+        # Single-sample forward graph (always built, for inference during data collection)
+        input_type = TensorType(dtype=DType.int32, shape=(9,), device=DeviceRef.CPU())
+        self.graph = _build_forward_graph("ttt_model", input_type, w1t, w2t, w3t, b1t, b2t, b3t)
         self.weights = [np.asarray(w).astype(np.float32) for w in weights]
-
-        # 2. Create an inference session.
         self.forward_session = engine.InferenceSession(devices=[CPU()])
         self.forward_model = self.forward_session.load(self.graph)
 
-        # Build backward graph.
-        d_pred_type = TensorType(
-            dtype=DType.float32, shape=(9,), device=DeviceRef.CPU()
-        )
-        self.backward_graph = _build_ttt_backward_graph(
-            input_type, w1t, w2t, w3t, b1t, b2t, b3t, d_pred_type
-        )
-        self.backward_session = engine.InferenceSession(devices=[CPU()])
-        self.backward_model = self.backward_session.load(self.backward_graph)
+        self.batch_size = batch_size
+        if batch_size is not None:
+            # Batched forward graph for training
+            batch_input_type = TensorType(
+                dtype=DType.int32, shape=(batch_size, 9), device=DeviceRef.CPU()
+            )
+            batched_fwd = _build_forward_graph(
+                "ttt_batched_fwd", batch_input_type, w1t, w2t, w3t, b1t, b2t, b3t
+            )
+            self.batched_fwd_session = engine.InferenceSession(devices=[CPU()])
+            self.batched_fwd_model = self.batched_fwd_session.load(batched_fwd)
+
+            # Batched backward graph for training
+            batch_d_pred_type = TensorType(
+                dtype=DType.float32, shape=(batch_size, 9), device=DeviceRef.CPU()
+            )
+            batched_bwd = _build_batched_backward_graph(
+                batch_input_type, w1t, w2t, w3t, b1t, b2t, b3t, batch_d_pred_type
+            )
+            self.batched_bwd_session = engine.InferenceSession(devices=[CPU()])
+            self.batched_bwd_model = self.batched_bwd_session.load(batched_bwd)
+        else:
+            # Single-sample backward graph (for non-batched usage)
+            d_pred_type = TensorType(
+                dtype=DType.float32, shape=(9,), device=DeviceRef.CPU()
+            )
+            self.backward_graph = _build_ttt_backward_graph(
+                input_type, w1t, w2t, w3t, b1t, b2t, b3t, d_pred_type
+            )
+            self.backward_session = engine.InferenceSession(devices=[CPU()])
+            self.backward_model = self.backward_session.load(self.backward_graph)
 
     def execute(self, state: list | np.ndarray) -> np.ndarray:
         """Forward pass. state: board as list or (9,) int32 array. Returns (9,) float32 numpy."""
@@ -311,6 +321,28 @@ class TTTModel:
         b2_t = _numpy_to_tensor_for_execute(self.weights[4], np.float32)
         b3_t = _numpy_to_tensor_for_execute(self.weights[5], np.float32)
         outputs = self.backward_model.execute(state_t, w1_t, w2_t, w3_t, b1_t, b2_t, b3_t, d_pred_t)
+        return (
+            _tensor_to_numpy(outputs[0]), _tensor_to_numpy(outputs[1]), _tensor_to_numpy(outputs[2]),
+            _tensor_to_numpy(outputs[3]), _tensor_to_numpy(outputs[4]), _tensor_to_numpy(outputs[5]),
+        )
+
+    def _weight_tensors(self) -> list:
+        """Convert current weights to MAX Tensors (for graph execution)."""
+        return [_numpy_to_tensor_for_execute(w, np.float32) for w in self.weights]
+
+    def execute_batch(self, states_np: np.ndarray) -> np.ndarray:
+        """Batched forward pass. states_np: (B, 9) int32. Returns (B, 9) float32."""
+        states_t = _numpy_to_tensor_for_execute(states_np, np.int32)
+        w_tensors = self._weight_tensors()
+        out_t = self.batched_fwd_model.execute(states_t, *w_tensors)[0]
+        return _tensor_to_numpy(out_t)
+
+    def backward_batch(self, states_np: np.ndarray, d_pred_np: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        """Batched backward pass. Returns accumulated (d_w1, d_w2, d_w3, d_b1, d_b2, d_b3)."""
+        states_t = _numpy_to_tensor_for_execute(states_np, np.int32)
+        d_pred_t = _numpy_to_tensor_for_execute(d_pred_np, np.float32)
+        w_tensors = self._weight_tensors()
+        outputs = self.batched_bwd_model.execute(states_t, *w_tensors, d_pred_t)
         return (
             _tensor_to_numpy(outputs[0]), _tensor_to_numpy(outputs[1]), _tensor_to_numpy(outputs[2]),
             _tensor_to_numpy(outputs[3]), _tensor_to_numpy(outputs[4]), _tensor_to_numpy(outputs[5]),
@@ -406,6 +438,86 @@ def _build_ttt_backward_graph(
     return graph
 
 
+def _build_batched_backward_graph(
+    batch_input_type: TensorType,
+    w1t: TensorType,
+    w2t: TensorType,
+    w3t: TensorType,
+    b1t: TensorType,
+    b2t: TensorType,
+    b3t: TensorType,
+    batch_d_pred_type: TensorType,
+) -> Graph:
+    """Build backward graph that processes a full batch at once.
+
+    Weight gradients are accumulated via matrix multiply (A.T @ B = sum of outer products).
+    Bias gradients are accumulated via sum along the batch axis.
+    """
+    with Graph(
+        "ttt_batched_bwd",
+        input_types=(batch_input_type, w1t, w2t, w3t, b1t, b2t, b3t, batch_d_pred_type),
+    ) as graph:
+        input_val = graph.inputs[0]    # (B, 9) int32
+        w1 = graph.inputs[1]           # (9, 128)
+        w2 = graph.inputs[2]           # (128, 64)
+        w3 = graph.inputs[3]           # (64, 9)
+        b1 = graph.inputs[4]           # (128,)
+        b2 = graph.inputs[5]           # (64,)
+        b3 = graph.inputs[6]           # (9,)
+        d_prediction = graph.inputs[7]  # (B, 9)
+
+        input_f = ops.cast(input_val, DType.float32)  # (B, 9)
+
+        # Recompute forward activations (same ops as forward)
+        pre_step1 = input_f @ w1 + b1   # (B, 128)
+        step1 = F.relu(pre_step1)       # (B, 128)
+        pre_step2 = step1 @ w2 + b2     # (B, 64)
+        step2 = F.relu(pre_step2)       # (B, 64)
+
+        d_step3 = d_prediction           # (B, 9)
+
+        # d_w3 = step2.T @ d_step3 — sum of outer products across the batch
+        step2_T = ops.transpose(step2, 0, 1)   # (64, B)
+        d_w3 = step2_T @ d_step3                # (64, 9)
+
+        # d_b3 = sum(d_step3, axis=0)
+        d_b3 = ops.squeeze(ops.sum(d_step3, 0), 0)  # (9,)
+
+        # d_step2 = d_step3 @ w3.T
+        w3_t = ops.transpose(w3, 0, 1)          # (9, 64)
+        d_step2 = d_step3 @ w3_t                 # (B, 64)
+
+        # ReLU backward for step2
+        zero = ops.constant(0.0, DType.float32, DeviceRef.CPU())
+        relu_mask_2 = ops.cast(ops.greater(pre_step2, zero), DType.float32)
+        d_pre_step2 = ops.mul(d_step2, relu_mask_2)  # (B, 64)
+
+        # d_w2 = step1.T @ d_pre_step2 — accumulated
+        step1_T = ops.transpose(step1, 0, 1)    # (128, B)
+        d_w2 = step1_T @ d_pre_step2             # (128, 64)
+
+        # d_b2 = sum(d_pre_step2, axis=0)
+        d_b2 = ops.squeeze(ops.sum(d_pre_step2, 0), 0)  # (64,)
+
+        # d_step1 = d_pre_step2 @ w2.T
+        w2_t = ops.transpose(w2, 0, 1)          # (64, 128)
+        d_step1 = d_pre_step2 @ w2_t             # (B, 128)
+
+        # ReLU backward for step1
+        relu_mask_1 = ops.cast(ops.greater(pre_step1, zero), DType.float32)
+        d_pre_step1 = ops.mul(d_step1, relu_mask_1)  # (B, 128)
+
+        # d_w1 = input_f.T @ d_pre_step1 — accumulated
+        input_f_T = ops.transpose(input_f, 0, 1)  # (9, B)
+        d_w1 = input_f_T @ d_pre_step1             # (9, 128)
+
+        # d_b1 = sum(d_pre_step1, axis=0)
+        d_b1 = ops.squeeze(ops.sum(d_pre_step1, 0), 0)  # (128,)
+
+        graph.output(d_w1, d_w2, d_w3, d_b1, d_b2, d_b3)
+    return graph
+
+
 def _normalize_board(board: list, player: int) -> list:
     """Normalize board from the given player's perspective.
 
@@ -496,7 +608,7 @@ def train_model(
         b1 = np.zeros(128, dtype=np.float32)
         b2 = np.zeros(64, dtype=np.float32)
         b3 = np.zeros(9, dtype=np.float32)
-    model = TTTModel([w1, w2, w3, b1, b2, b3])
+    model = TTTModel([w1, w2, w3, b1, b2, b3], batch_size=batch_size)
 
     # Target network: a frozen snapshot of the weights used for stable TD targets.
     target_weights = [w.copy() for w in model.weights]
@@ -532,39 +644,35 @@ def train_model(
             next_states = [s[3] for s in samples]
             dones = [s[4] for s in samples]
 
-            # Forward pass (numpy in/out; model.execute converts at boundary).
-            predictions = [model.execute(st) for st in states]
-            prediction = np.stack(predictions, axis=0).astype(np.float32)
+            # Prepare batched numpy arrays
+            states_np = np.array(states, dtype=np.int32)            # (B, 9)
+            next_states_np = np.array(next_states, dtype=np.int32)  # (B, 9)
+            actions_np = np.array(actions, dtype=np.int32)          # (B,)
+            rewards_np = np.array(rewards, dtype=np.float32)        # (B,)
+            dones_np = np.array(dones, dtype=np.float32)            # (B,)
 
-            # Use frozen target weights for TD target computation (stability).
+            # Batched forward pass (1 graph execution instead of batch_size)
+            prediction = model.execute_batch(states_np)
+
+            # Batched TD target computation (1 graph execution instead of batch_size)
             online_weights = model.weights
             model.weights = target_weights
-            td_targets = compute_td_targets(model, next_states, rewards, dones)
+            q_next = model.execute_batch(next_states_np)
             model.weights = online_weights
+            q_next[next_states_np != 0] = -np.inf
+            max_next_q = np.max(q_next, axis=1)
+            td_targets = np.where(dones_np, rewards_np, rewards_np - GAMMA * max_next_q)
 
             target = prediction.copy()
-            for j in range(len(actions)):
-                target[j, actions[j]] = td_targets[j]
+            target[np.arange(batch_size), actions_np] = td_targets
 
             # Loss: mean over batch of per-action squared error
             loss_mse = float(np.sum((prediction - target) ** 2) / batch_size)
 
-            d_pred = 2.0 * (prediction - target) / batch_size
+            d_pred = (2.0 * (prediction - target) / batch_size).astype(np.float32)
 
-            d_w1_acc = np.zeros((9, 128), dtype=np.float32)
-            d_w2_acc = np.zeros((128, 64), dtype=np.float32)
-            d_w3_acc = np.zeros((64, 9), dtype=np.float32)
-            d_b1_acc = np.zeros(128, dtype=np.float32)
-            d_b2_acc = np.zeros(64, dtype=np.float32)
-            d_b3_acc = np.zeros(9, dtype=np.float32)
-            for j in range(batch_size):
-                d_w1_j, d_w2_j, d_w3_j, d_b1_j, d_b2_j, d_b3_j = model.backward(states[j], d_pred[j])
-                d_w1_acc += d_w1_j
-                d_w2_acc += d_w2_j
-                d_w3_acc += d_w3_j
-                d_b1_acc += d_b1_j
-                d_b2_acc += d_b2_j
-                d_b3_acc += d_b3_j
+            # Batched backward pass (1 graph execution instead of batch_size)
+            d_w1_acc, d_w2_acc, d_w3_acc, d_b1_acc, d_b2_acc, d_b3_acc = model.backward_batch(states_np, d_pred)
 
             grads = [d_w1_acc, d_w2_acc, d_w3_acc, d_b1_acc, d_b2_acc, d_b3_acc]
 
